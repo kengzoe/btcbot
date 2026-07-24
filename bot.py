@@ -1,4 +1,4 @@
-# BTC Bot – Relaxed SMC with Supply/Demand (15min)
+# BTC Bot – Relaxed SMC with Supply/Demand, Candle Patterns (15min)
 import encodings.idna
 import os, logging, requests, threading, numpy as np
 from datetime import datetime, timezone
@@ -13,9 +13,8 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 CHAT_ID, RUN_SIGNALS = None, False
 
-# -------- CONFIG ---------
 TIMEFRAME = "15min"
-PRICE_INTERVAL_SECONDS = 900          # 15 minutes
+PRICE_INTERVAL_SECONDS = 900
 RISK_REWARD_MULTIPLIER = 2.0
 MIN_STOP_POINTS = 200                # wider for BTC
 MAX_DAILY_LOSSES = 6
@@ -146,6 +145,41 @@ def price_near_zone(price, zone, atr):
     if zone is None: return False
     return abs(price - zone) < atr
 
+# ========== CANDLE PATTERN DETECTION ==========
+def detect_candle_patterns(candles):
+    """Return (pattern_name, signal_type) or (None, None)."""
+    if len(candles) < 2:
+        return None, None
+    prev = candles[-2]
+    curr = candles[-1]
+
+    o1, h1, l1, c1 = prev["open"], prev["high"], prev["low"], prev["close"]
+    o2, h2, l2, c2 = curr["open"], curr["high"], curr["low"], curr["close"]
+
+    # Engulfing
+    if c1 < o1 and c2 > o2 and c2 > o1 and o2 < c1:
+        return "Bullish Engulfing", "BUY"
+    if c1 > o1 and c2 < o2 and c2 < o1 and o2 > c1:
+        return "Bearish Engulfing", "SELL"
+
+    # Hammer / Shooting Star
+    body = abs(c2 - o2)
+    lower_wick = min(o2, c2) - l2
+    upper_wick = h2 - max(o2, c2)
+    total_range = h2 - l2
+    if total_range > 0:
+        if lower_wick > 2 * body and upper_wick < body and c2 > o2:
+            return "Hammer", "BUY"
+        if upper_wick > 2 * body and lower_wick < body and c2 < o2:
+            return "Shooting Star", "SELL"
+
+    # Doji
+    if total_range > 0 and body / total_range < 0.1:
+        return "Doji", None
+
+    return None, None
+# ==================================================
+
 def process_signals():
     global RISK_REWARD_MULTIPLIER, STATS
     candles = fetch_real_candles()
@@ -166,6 +200,9 @@ def process_signals():
     fvg = detect_fvg(candles)
     bullish_ob, bearish_ob = detect_order_blocks(candles)
     choch = detect_choch(candles)
+
+    # Candle pattern detection
+    pattern_name, pattern_type = detect_candle_patterns(candles)
 
     sig = None
     reason = ""
@@ -188,6 +225,15 @@ def process_signals():
         if rng > 0:
             body_ratio = abs(last["close"] - last["open"]) / rng
             if body_ratio > 0.5: score += 5; reasons.append("StrongCandle")
+
+        # ----- CANDLE PATTERN POINTS -----
+        if pattern_type == "BUY":
+            score += 15
+            reasons.append(pattern_name)
+        elif pattern_name == "Doji" and trend_up:
+            score += 10
+            reasons.append("Doji+Trend↑")
+        # ---------------------------------
 
         if score >= 45:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
@@ -215,6 +261,15 @@ def process_signals():
         if rng > 0:
             body_ratio = abs(last["close"] - last["open"]) / rng
             if body_ratio > 0.5: score += 5; reasons.append("StrongCandle")
+
+        # ----- CANDLE PATTERN POINTS -----
+        if pattern_type == "SELL":
+            score += 15
+            reasons.append(pattern_name)
+        elif pattern_name == "Doji" and trend_down:
+            score += 10
+            reasons.append("Doji+Trend↓")
+        # ---------------------------------
 
         if score >= 45:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
@@ -373,7 +428,7 @@ async def set_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ RR: {val}x")
 
 async def join_vip(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔒 *XAUUSD VIP Signals*\n\n💰 *$25/month*\n💎 USDT (TRC20): `TFEYT12uggMhmhncqFSc8SAFzpdz6YfS2j`\n✅ Send screenshot to @pipzoe", parse_mode="Markdown")
+    await update.message.reply_text("🔒 *VIP Signals (Gold, BTC, NASDAQ)*\n\n💰 *$25/month*\n💎 USDT (TRC20): `TFEYT12uggMhmhncqFSc8SAFzpdz6YfS2j`\n✅ Send screenshot to @XAU_EDGE", parse_mode="Markdown")
 
 application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 application.add_handler(CommandHandler("start", start))
