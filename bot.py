@@ -25,7 +25,7 @@ ACTIVE_POSITIONS = []
 STATS = {"total_signals":0,"tp1_hits":0,"tp2_hits":0,"sl_hits":0,"daily_losses":0}
 SIGNAL_HISTORY = []
 
-FREE_CHANNEL_ID = -100xxxxxxxx   # <-- your forex/oil free channel ID
+FREE_CHANNEL_ID = --1004410090098   # <-- your forex/oil free channel ID
 VIP_CHANNEL_ID = -1004416190238
 HISTORY_CHANNEL_ID = FREE_CHANNEL_ID
 
