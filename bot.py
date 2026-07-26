@@ -1,7 +1,7 @@
-# Generic SMC Bot – BOS, S/R Bounce, Candle Patterns, Supply/Demand
+# BTC/USD Bot – 15min, MTF (4H+1H), SMC, No Chart, No Buttons
 import encodings.idna
-import os, logging, requests, threading, numpy as np
-from datetime import datetime, timezone
+import os, logging, requests, threading, numpy as np, asyncio
+from datetime import datetime, timezone, timedelta, time
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -13,26 +13,25 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWELVE_DATA_KEY = os.getenv("TWELVE_DATA_KEY")
 CHAT_ID, RUN_SIGNALS = None, False
 
-# ===== CONFIG =====
-SYMBOL = "BTC/USD"               # <-- change per bot
+SYMBOL = "BTC/USD"
 TIMEFRAME = "15min"
 PRICE_INTERVAL_SECONDS = 900
 RISK_REWARD_MULTIPLIER = 2.0
-MIN_STOP_POINTS = 200            # <-- change per bot (BTC:200, Oil:0.15, Forex:0.0005)
+MIN_STOP_POINTS = 200                # wider for BTC
 MAX_DAILY_LOSSES = 6
 
 ACTIVE_POSITIONS = []
 STATS = {"total_signals":0,"tp1_hits":0,"tp2_hits":0,"sl_hits":0,"daily_losses":0}
 SIGNAL_HISTORY = []
 
-FREE_CHANNEL_ID = --1004410090098   # <-- your forex/oil free channel ID
+FREE_CHANNEL_ID = -1004410090098      # @XAU_EDGE (or your BTC free channel)
 VIP_CHANNEL_ID = -1004416190238
 HISTORY_CHANNEL_ID = FREE_CHANNEL_ID
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return f"{SYMBOL} Bot is running!"
+    return "BTC Bot (15min MTF) is running!"
 
 cached_candles = []
 last_fetch_time = 0
@@ -58,13 +57,48 @@ def fetch_real_candles():
                 })
             cached_candles = candles
             last_fetch_time = now
-            logger.info(f"Fetched {len(candles)} {SYMBOL} candles. Price: {candles[-1]['close']}")
+            logger.info(f"Fetched {len(candles)} {SYMBOL} candles. Price: ${candles[-1]['close']:.2f}")
             return candles
     except Exception as e:
         logger.error(f"API error: {e}")
     return cached_candles
 
-# ----- All detection functions (exactly as in gold) -----
+# ---------- MTF Helpers ----------
+def fetch_tf_candles(symbol, interval="4h", outputsize=20):
+    api_key = os.getenv("TWELVE_DATA_KEY")
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}"
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if data.get("status") == "ok" and "values" in data:
+            candles = []
+            for bar in reversed(data["values"]):
+                candles.append({
+                    "open": float(bar["open"]),
+                    "high": float(bar["high"]),
+                    "low": float(bar["low"]),
+                    "close": float(bar["close"]),
+                    "date": bar["datetime"]
+                })
+            return candles
+    except:
+        pass
+    return []
+
+def tf_trend(candles):
+    if len(candles) < 20:
+        return None
+    closes = [c["close"] for c in candles]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    current = closes[-1]
+    if ema20 > ema50 and current > ema20:
+        return "BULLISH"
+    elif ema20 < ema50 and current < ema20:
+        return "BEARISH"
+    return None
+
+# ---------- Indicators & SMC Detection ----------
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return MIN_STOP_POINTS
@@ -187,6 +221,7 @@ def detect_sr_bounce(candles, atr):
         return "RESISTANCE", "SELL"
     return None, None
 
+# ---------- Signal Engine with MTF ----------
 def process_signals():
     global RISK_REWARD_MULTIPLIER, STATS
     candles = fetch_real_candles()
@@ -210,6 +245,12 @@ def process_signals():
     bos = detect_bos(candles)
     sr_type, sr_signal = detect_sr_bounce(candles, atr)
 
+    # ===== MTF =====
+    h4_candles = fetch_tf_candles(SYMBOL, "4h", 20)
+    h1_candles = fetch_tf_candles(SYMBOL, "1h", 20)
+    h4_trend = tf_trend(h4_candles)
+    h1_trend = tf_trend(h1_candles)
+
     sig, reason, grade, score_val = None, "", "C", 0
 
     # BUY
@@ -231,9 +272,15 @@ def process_signals():
         if bos == "BULLISH": score += 20; reasons.append("BOS↑")
         if sr_type == "SUPPORT": score += 15; reasons.append("SupportBounce")
 
+        # ----- MTF Bonus -----
+        if h4_trend == "BULLISH":
+            score += 15; reasons.append("4H✅")
+        if h1_trend == "BULLISH":
+            score += 10; reasons.append("1H✅")
+
         if score >= 55:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
-            sig = "BUY"; reason = " + ".join(reasons) + f" | ATR:{atr:.5f}"
+            sig = "BUY"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
             sl = current_price - stop_distance
             tp1 = current_price + stop_distance * RISK_REWARD_MULTIPLIER
             tp2 = current_price + stop_distance * RISK_REWARD_MULTIPLIER * 2
@@ -259,9 +306,15 @@ def process_signals():
         if bos == "BEARISH": score += 20; reasons.append("BOS↓")
         if sr_type == "RESISTANCE": score += 15; reasons.append("ResistanceReject")
 
+        # ----- MTF Bonus -----
+        if h4_trend == "BEARISH":
+            score += 15; reasons.append("4H✅")
+        if h1_trend == "BEARISH":
+            score += 10; reasons.append("1H✅")
+
         if score >= 55:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
-            sig = "SELL"; reason = " + ".join(reasons) + f" | ATR:{atr:.5f}"
+            sig = "SELL"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
             sl = current_price + stop_distance
             tp1 = current_price - stop_distance * RISK_REWARD_MULTIPLIER
             tp2 = current_price - stop_distance * RISK_REWARD_MULTIPLIER * 2
@@ -274,7 +327,7 @@ def process_signals():
                 "status":"PENDING","grade":grade,"score":score_val}
     return None
 
-# ----- monitor_positions, signal_loop, commands identical to gold, just use f"{SYMBOL}" in messages -----
+# ---------- Monitor & Signal Loop (plain text) ----------
 async def monitor_positions(bot, price):
     global ACTIVE_POSITIONS, CHAT_ID, STATS, SIGNAL_HISTORY
     surv = []
@@ -282,40 +335,40 @@ async def monitor_positions(bot, price):
         if p["status"] == "PENDING":
             if (price <= p["entry"]) if p["type"] == "BUY" else (price >= p["entry"]):
                 p["status"] = "ACTIVE"
-                await bot.send_message(chat_id=CHAT_ID, text=f"✅ {SYMBOL} {p['type']} EXECUTED at {price:.5f}")
+                await bot.send_message(chat_id=CHAT_ID, text=f"✅ BTC {p['type']} EXECUTED at ${price:.2f}")
             surv.append(p); continue
         if p["type"] == "BUY":
             if price <= p["sl"]:
                 STATS["sl_hits"] += 1; STATS["daily_losses"] += 1
-                await bot.send_message(chat_id=CHAT_ID, text=f"🔴 {SYMBOL} SL HIT {p['sl']:.5f}")
+                await bot.send_message(chat_id=CHAT_ID, text=f"🔴 BTC SL HIT ${p['sl']:.2f}")
                 SIGNAL_HISTORY.append({"type":p["type"],"entry":p["entry"],"exit":price,"result":"SL","grade":p.get("grade","C"),"time":datetime.now(timezone.utc).strftime("%H:%M UTC")})
-                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"❌ {SYMBOL} {p['type']} SL\nGrade: {p.get('grade','C')}\nEntry: {p['entry']:.5f}\nExit: {price:.5f}")
+                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"❌ BTC {p['type']} SL\nGrade: {p.get('grade','C')}\nEntry: ${p['entry']:.2f}\nExit: ${price:.2f}")
             elif price >= p["tp2"]:
                 STATS["tp2_hits"] += 1
-                await bot.send_message(chat_id=CHAT_ID, text=f"👑 {SYMBOL} TP2 {p['tp2']:.5f}")
+                await bot.send_message(chat_id=CHAT_ID, text=f"👑 BTC TP2 ${p['tp2']:.2f}")
                 SIGNAL_HISTORY.append({"type":p["type"],"entry":p["entry"],"exit":price,"result":"TP2","grade":p.get("grade","C"),"time":datetime.now(timezone.utc).strftime("%H:%M UTC")})
-                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"✅ {SYMBOL} {p['type']} TP2\nGrade: {p.get('grade','C')}\nEntry: {p['entry']:.5f}\nExit: {price:.5f}")
+                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"✅ BTC {p['type']} TP2\nGrade: {p.get('grade','C')}\nEntry: ${p['entry']:.2f}\nExit: ${price:.2f}")
             elif price >= p["tp1"] and not p.get("tp1_hit"):
                 p["tp1_hit"] = True; STATS["tp1_hits"] += 1
                 p["sl"] = p["entry"]
-                await bot.send_message(chat_id=CHAT_ID, text=f"💰 {SYMBOL} TP1 {p['tp1']:.5f} | SL→BE 🔒")
+                await bot.send_message(chat_id=CHAT_ID, text=f"💰 BTC TP1 ${p['tp1']:.2f} | SL→BE 🔒")
                 surv.append(p)
             else: surv.append(p)
         elif p["type"] == "SELL":
             if price >= p["sl"]:
                 STATS["sl_hits"] += 1; STATS["daily_losses"] += 1
-                await bot.send_message(chat_id=CHAT_ID, text=f"🔴 {SYMBOL} SL HIT {p['sl']:.5f}")
+                await bot.send_message(chat_id=CHAT_ID, text=f"🔴 BTC SL HIT ${p['sl']:.2f}")
                 SIGNAL_HISTORY.append({"type":p["type"],"entry":p["entry"],"exit":price,"result":"SL","grade":p.get("grade","C"),"time":datetime.now(timezone.utc).strftime("%H:%M UTC")})
-                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"❌ {SYMBOL} {p['type']} SL\nGrade: {p.get('grade','C')}\nEntry: {p['entry']:.5f}\nExit: {price:.5f}")
+                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"❌ BTC {p['type']} SL\nGrade: {p.get('grade','C')}\nEntry: ${p['entry']:.2f}\nExit: ${price:.2f}")
             elif price <= p["tp2"]:
                 STATS["tp2_hits"] += 1
-                await bot.send_message(chat_id=CHAT_ID, text=f"👑 {SYMBOL} TP2 {p['tp2']:.5f}")
+                await bot.send_message(chat_id=CHAT_ID, text=f"👑 BTC TP2 ${p['tp2']:.2f}")
                 SIGNAL_HISTORY.append({"type":p["type"],"entry":p["entry"],"exit":price,"result":"TP2","grade":p.get("grade","C"),"time":datetime.now(timezone.utc).strftime("%H:%M UTC")})
-                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"✅ {SYMBOL} {p['type']} TP2\nGrade: {p.get('grade','C')}\nEntry: {p['entry']:.5f}\nExit: {price:.5f}")
+                await bot.send_message(chat_id=HISTORY_CHANNEL_ID, text=f"✅ BTC {p['type']} TP2\nGrade: {p.get('grade','C')}\nEntry: ${p['entry']:.2f}\nExit: ${price:.2f}")
             elif price <= p["tp1"] and not p.get("tp1_hit"):
                 p["tp1_hit"] = True; STATS["tp1_hits"] += 1
                 p["sl"] = p["entry"]
-                await bot.send_message(chat_id=CHAT_ID, text=f"💰 {SYMBOL} TP1 {p['tp1']:.5f} | SL→BE 🔒")
+                await bot.send_message(chat_id=CHAT_ID, text=f"💰 BTC TP1 ${p['tp1']:.2f} | SL→BE 🔒")
                 surv.append(p)
             else: surv.append(p)
     ACTIVE_POSITIONS = surv
@@ -332,41 +385,91 @@ async def signal_loop(context: ContextTypes.DEFAULT_TYPE):
             ACTIVE_POSITIONS.append(sig)
             grade = sig.get("grade","C"); score = sig.get("score",0)
             emoji = "🟢" if sig['type']=="BUY" else "🔴"
-            vip_msg = (f"{emoji} {SYMBOL} {grade} {sig['type']} SIGNAL\nScore: {score}/100\n"
-                       f"Entry: {sig['entry']:.5f}\nSL: {sig['sl']:.5f}\nTP1: {sig['tp1']:.5f}\nTP2: {sig['tp2']:.5f}\n"
-                       f"Reason: {sig['reason']}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n🔒 VIP Instant Signal")
-            free_msg = (f"{emoji} {SYMBOL} {grade} {sig['type']} SIGNAL\nScore: {score}/100\n"
-                        f"Entry: {sig['entry']:.5f}\nSL: {sig['sl']:.5f}\nTP1: {sig['tp1']:.5f}\n\n⚡ Full details in VIP: /join_vip")
+
+            vip_msg = (
+                f"┌─────────────────────────────────┐\n"
+                f"│  {emoji} {sig['type']} BTC/USD  │  {grade}  │  {score}%  │\n"
+                f"└─────────────────────────────────┘\n"
+                f"  Entry    ${sig['entry']:.2f}\n"
+                f"  SL       ${sig['sl']:.2f} ({abs(sig['entry']-sig['sl']):.1f} pts)\n"
+                f"  TP1      ${sig['tp1']:.2f} (+{abs(sig['tp1']-sig['entry']):.1f} pts)\n"
+                f"  TP2      ${sig['tp2']:.2f} (+{abs(sig['tp2']-sig['entry']):.1f} pts)\n\n"
+                f"  [{sig['reason'].replace(' | ','] [')}]\n\n"
+                f"  ⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+            )
             await context.bot.send_message(chat_id=VIP_CHANNEL_ID, text=vip_msg)
+
+            free_msg = (
+                f"┌─────────────────────────────────┐\n"
+                f"│  {emoji} {sig['type']} BTC/USD  │  {grade}  │  {score}%  │\n"
+                f"└─────────────────────────────────┘\n"
+                f"  Entry    ${sig['entry']:.2f}\n"
+                f"  SL       ${sig['sl']:.2f}\n"
+                f"  TP1      ${sig['tp1']:.2f}\n\n"
+                f"  ⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}\n"
+                f"  ⚡ Full breakdown in VIP: /join_vip"
+            )
             await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=free_msg)
             await context.bot.send_message(chat_id=CHAT_ID, text=vip_msg)
+
+# ---------- Daily Bias ----------
+async def daily_bias(context: ContextTypes.DEFAULT_TYPE):
+    if not RUN_SIGNALS or not CHAT_ID: return
+    api_key = os.getenv("TWELVE_DATA_KEY")
+    if not api_key: return
+    url = f"https://api.twelvedata.com/time_series?symbol=BTC/USD&interval=1h&outputsize=20&apikey={api_key}"
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if data.get("status") == "ok" and "values" in data:
+            closes = [float(bar["close"]) for bar in reversed(data["values"])]
+              ema_20 = calculate_ema(closes, 20)
+            ema_50 = calculate_ema(closes, 50)
+            current = closes[-1]
+            if ema_20 > ema_50 and current > ema_20:
+                bias = "🟢 BULLISH"
+                advice = "Prefer BUY setups."
+            elif ema_20 < ema_50 and current < ema_20:
+                bias = "🔴 BEARISH"
+                advice = "Prefer SELL setups."
+            else:
+                bias = "⚪ NEUTRAL"
+                advice = "Wait for clear break."
+        else:
+            bias, advice = "⚪ UNKNOWN", "No data."
+    except:
+        bias, advice = "⚪ UNKNOWN", "Error."
+    await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=f"📊 *BTC/USD DAILY BIAS* – {bias}\n{advice}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
 
 async def report_callback(context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID, STATS
     if not CHAT_ID: return
     total = STATS["tp1_hits"] + STATS["tp2_hits"] + STATS["sl_hits"]
     wr = ((STATS["tp1_hits"]+STATS["tp2_hits"])/total*100) if total>0 else 0
-    await context.bot.send_message(chat_id=CHAT_ID, text=f"📅 DAILY {SYMBOL}\nSignals: {STATS['total_signals']}\nTP1: {STATS['tp1_hits']} TP2: {STATS['tp2_hits']}\nSL: {STATS['sl_hits']}\nWin: {wr:.1f}%")
+    await context.bot.send_message(chat_id=CHAT_ID, text=f"📅 DAILY BTC\nSignals: {STATS['total_signals']}\nTP1: {STATS['tp1_hits']} TP2: {STATS['tp2_hits']}\nSL: {STATS['sl_hits']}\nWin: {wr:.1f}%")
     STATS["total_signals"]=STATS["tp1_hits"]=STATS["tp2_hits"]=STATS["sl_hits"]=STATS["daily_losses"]=0
 
+# ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID; CHAT_ID = update.effective_chat.id
-    await update.message.reply_text(f"{SYMBOL} SMC Bot ({TIMEFRAME})\n/start_signals /stop_signals /status /report /history /join_vip")
+    await update.message.reply_text("🟠 BTC/USD SMC (15min MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
 
 async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS, CHAT_ID
     CHAT_ID = update.effective_chat.id
     if RUN_SIGNALS: await update.message.reply_text("Already running"); return
     RUN_SIGNALS = True
-    context.job_queue.run_repeating(signal_loop, interval=PRICE_INTERVAL_SECONDS, name="job")
+    context.job_queue.run_repeating(signal_loop, interval=PRICE_INTERVAL_SECONDS, name="btc_job")
     context.job_queue.run_repeating(report_callback, interval=86400, first=86400, name="report_job")
-    await update.message.reply_text(f"🚀 {SYMBOL} scanning started")
+    context.job_queue.run_daily(daily_bias, time=time(hour=8, minute=0, tzinfo=timezone.utc), name="bias_job")
+    await update.message.reply_text("🚀 BTC scanner started (15min MTF) + daily bias")
 
 async def stop_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS
     RUN_SIGNALS = False
-    for j in context.job_queue.get_jobs_by_name("job"): j.schedule_removal()
+    for j in context.job_queue.get_jobs_by_name("btc_job"): j.schedule_removal()
     for j in context.job_queue.get_jobs_by_name("report_job"): j.schedule_removal()
+    for j in context.job_queue.get_jobs_by_name("bias_job"): j.schedule_removal()
     await update.message.reply_text("⏸️ Stopped")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -374,19 +477,19 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candles = fetch_real_candles()
     price = candles[-1]["close"] if candles else "N/A"
     count = len(candles) if candles else 0
-    await update.message.reply_text(f"📊 {SYMBOL} State: {'ACTIVE' if RUN_SIGNALS else 'IDLE'}\nPrice: {price}\nCandles: {count}/30\nTrades: {len(ACTIVE_POSITIONS)}\nLosses: {STATS['daily_losses']}/{MAX_DAILY_LOSSES}")
+    await update.message.reply_text(f"📊 BTC State: {'ACTIVE' if RUN_SIGNALS else 'IDLE'}\nPrice: ${price}\nCandles: {count}/30\nTrades: {len(ACTIVE_POSITIONS)}\nLosses: {STATS['daily_losses']}/{MAX_DAILY_LOSSES}")
 
 async def manual_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global STATS
     total = STATS["tp1_hits"] + STATS["tp2_hits"] + STATS["sl_hits"]
     wr = ((STATS["tp1_hits"]+STATS["tp2_hits"])/total*100) if total>0 else 0
-    await update.message.reply_text(f"📝 {SYMBOL}: {STATS['total_signals']} signals, TP1: {STATS['tp1_hits']} TP2: {STATS['tp2_hits']} SL: {STATS['sl_hits']} Win: {wr:.1f}%")
+    await update.message.reply_text(f"📝 BTC Signals: {STATS['total_signals']}\nTP1: {STATS['tp1_hits']} TP2: {STATS['tp2_hits']}\nSL: {STATS['sl_hits']}\nWin: {wr:.1f}%")
 
 async def signal_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global SIGNAL_HISTORY
     if not SIGNAL_HISTORY: await update.message.reply_text("No closed trades yet."); return
     last10 = SIGNAL_HISTORY[-10:]
-    msg = f"📜 LAST 10 {SYMBOL} TRADES\n\n"
+    msg = "📜 LAST 10 BTC TRADES\n\n"
     for t in reversed(last10):
         emoji = "✅" if t["result"] != "SL" else "❌"
         msg += f"{emoji} {t['type']} {t['result']} | {t['grade']} | {t['time']}\n"
@@ -403,8 +506,8 @@ async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if val < 60: await update.message.reply_text("Min 60s"); return
     PRICE_INTERVAL_SECONDS = val
     if RUN_SIGNALS:
-        for j in context.job_queue.get_jobs_by_name("job"): j.schedule_removal()
-        context.job_queue.run_repeating(signal_loop, interval=val, name="job")
+        for j in context.job_queue.get_jobs_by_name("btc_job"): j.schedule_removal()
+        context.job_queue.run_repeating(signal_loop, interval=val, name="btc_job")
     await update.message.reply_text(f"✅ {val}s")
 
 async def set_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
