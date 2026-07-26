@@ -423,7 +423,7 @@ async def daily_bias(context: ContextTypes.DEFAULT_TYPE):
         data = res.json()
         if data.get("status") == "ok" and "values" in data:
             closes = [float(bar["close"]) for bar in reversed(data["values"])]
-              ema_20 = calculate_ema(closes, 20)
+            ema_20 = calculate_ema(closes, 20)
             ema_50 = calculate_ema(closes, 50)
             current = closes[-1]
             if ema_20 > ema_50 and current > ema_20:
