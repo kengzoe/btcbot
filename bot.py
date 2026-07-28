@@ -1,4 +1,4 @@
-# BTC/USD Bot – 15min, MTF (4H+1H), SMC, No Chart, No Buttons
+# BTC/USD Bot – 15min, High‑Win MTF, Volatility Filter, No Chart, No Buttons
 import encodings.idna
 import os, logging, requests, threading, numpy as np, asyncio
 from datetime import datetime, timezone, timedelta, time
@@ -18,7 +18,8 @@ TIMEFRAME = "15min"
 PRICE_INTERVAL_SECONDS = 900
 RISK_REWARD_MULTIPLIER = 2.0
 MIN_STOP_POINTS = 200                # wider for BTC
-MAX_DAILY_LOSSES = 6
+MAX_DAILY_LOSSES = 3                 # reduced from 6
+MIN_ATR = 150                        # skip if 15min ATR < 150 (choppy market)
 
 ACTIVE_POSITIONS = []
 STATS = {"total_signals":0,"tp1_hits":0,"tp2_hits":0,"sl_hits":0,"daily_losses":0}
@@ -31,7 +32,7 @@ HISTORY_CHANNEL_ID = FREE_CHANNEL_ID
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "BTC Bot (15min MTF) is running!"
+    return "BTC Bot (15min High‑Win MTF) is running!"
 
 cached_candles = []
 last_fetch_time = 0
@@ -98,7 +99,7 @@ def tf_trend(candles):
         return "BEARISH"
     return None
 
-# ---------- Indicators & SMC Detection ----------
+# ---------- Indicators & SMC Detection (unchanged) ----------
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return MIN_STOP_POINTS
@@ -221,7 +222,7 @@ def detect_sr_bounce(candles, atr):
         return "RESISTANCE", "SELL"
     return None, None
 
-# ---------- Signal Engine with MTF ----------
+# ---------- Signal Engine (High‑Win) ----------
 def process_signals():
     global RISK_REWARD_MULTIPLIER, STATS
     candles = fetch_real_candles()
@@ -231,6 +232,12 @@ def process_signals():
     closes = [c["close"] for c in candles]
     current_price = closes[-1]
     atr = calculate_atr(candles)
+
+    # ----- Volatility Filter -----
+    if atr < MIN_ATR:
+        logger.info(f"ATR too low ({atr:.1f}), skipping")
+        return None
+
     resistance, support = find_swing_levels(candles)
 
     ema_fast = calculate_ema(closes, 10)
@@ -245,16 +252,29 @@ def process_signals():
     bos = detect_bos(candles)
     sr_type, sr_signal = detect_sr_bounce(candles, atr)
 
-    # ===== MTF =====
+    # ===== MTF (mandatory 4H alignment) =====
     h4_candles = fetch_tf_candles(SYMBOL, "4h", 20)
     h1_candles = fetch_tf_candles(SYMBOL, "1h", 20)
-    h4_trend = tf_trend(h4_candles)
-    h1_trend = tf_trend(h1_candles)
+    h4_trend = tf_trend(h4_candles) if h4_candles else None
+    h1_trend = tf_trend(h1_candles) if h1_candles else None
+
+    # If 4H trend is unknown, we still allow signals but without bonus (don't block)
+    # But we make 4H alignment mandatory only if trend is known
+    # For 4H mandatory: if trend is known AND it's opposite to signal, reject.
+    def four_h_ok(direction):
+        if h4_trend is None:
+            return True    # no data, can't block
+        return h4_trend == direction
 
     sig, reason, grade, score_val = None, "", "C", 0
 
     # BUY
     if fvg == "BUY" or choch == "BULLISH" or (bullish_ob and price_near_zone(current_price, bullish_ob["low"], atr)):
+        # Mandatory 4H: must not be BEARISH (if known)
+        if h4_trend == "BEARISH":
+            logger.info("4H bearish, rejecting BUY")
+            return None
+
         score = 0; reasons = []
         if fvg == "BUY": score += 20; reasons.append("FVG")
         if choch == "BULLISH": score += 25; reasons.append("CHoCH")
@@ -278,17 +298,23 @@ def process_signals():
         if h1_trend == "BULLISH":
             score += 10; reasons.append("1H✅")
 
-        if score >= 55:
+        if score >= 75:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
             sig = "BUY"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
             sl = current_price - stop_distance
             tp1 = current_price + stop_distance * RISK_REWARD_MULTIPLIER
             tp2 = current_price + stop_distance * RISK_REWARD_MULTIPLIER * 2
-            grade = "A" if score >= 70 else ("B" if score >= 55 else "C")
+            # Grade based on score (only A or B since threshold is 75)
+            grade = "A" if score >= 90 else "B"
             score_val = score
 
     # SELL
     elif fvg == "SELL" or choch == "BEARISH" or (bearish_ob and price_near_zone(current_price, bearish_ob["high"], atr)):
+        # Mandatory 4H: must not be BULLISH (if known)
+        if h4_trend == "BULLISH":
+            logger.info("4H bullish, rejecting SELL")
+            return None
+
         score = 0; reasons = []
         if fvg == "SELL": score += 20; reasons.append("FVG")
         if choch == "BEARISH": score += 25; reasons.append("CHoCH")
@@ -312,13 +338,13 @@ def process_signals():
         if h1_trend == "BEARISH":
             score += 10; reasons.append("1H✅")
 
-        if score >= 55:
+        if score >= 75:
             stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
             sig = "SELL"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
             sl = current_price + stop_distance
             tp1 = current_price - stop_distance * RISK_REWARD_MULTIPLIER
             tp2 = current_price - stop_distance * RISK_REWARD_MULTIPLIER * 2
-            grade = "A" if score >= 70 else ("B" if score >= 55 else "C")
+            grade = "A" if score >= 90 else "B"
             score_val = score
 
     if sig:
@@ -383,7 +409,7 @@ async def signal_loop(context: ContextTypes.DEFAULT_TYPE):
         sig = process_signals()
         if sig:
             ACTIVE_POSITIONS.append(sig)
-            grade = sig.get("grade","C"); score = sig.get("score",0)
+            grade = sig.get("grade","B"); score = sig.get("score",0)
             emoji = "🟢" if sig['type']=="BUY" else "🔴"
 
             vip_msg = (
@@ -452,7 +478,7 @@ async def report_callback(context: ContextTypes.DEFAULT_TYPE):
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID; CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("🟠 BTC/USD SMC (15min MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
+    await update.message.reply_text("🟠 BTC/USD SMC (15min High‑Win MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
 
 async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS, CHAT_ID
@@ -462,7 +488,7 @@ async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.job_queue.run_repeating(signal_loop, interval=PRICE_INTERVAL_SECONDS, name="btc_job")
     context.job_queue.run_repeating(report_callback, interval=86400, first=86400, name="report_job")
     context.job_queue.run_daily(daily_bias, time=time(hour=8, minute=0, tzinfo=timezone.utc), name="bias_job")
-    await update.message.reply_text("🚀 BTC scanner started (15min MTF) + daily bias")
+    await update.message.reply_text("🚀 BTC High‑Win scanner started (15min) + daily bias")
 
 async def stop_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS
