@@ -1,4 +1,4 @@
-# BTC/USD Bot – 15min, High‑Win MTF, Volatility Filter, No Chart, No Buttons
+# BTC/USD – Advanced MTF (4H+1H+15min), SMC, Liquidity, Key Levels, Candlestick Confirmation
 import encodings.idna
 import os, logging, requests, threading, numpy as np, asyncio
 from datetime import datetime, timezone, timedelta, time
@@ -17,31 +17,31 @@ SYMBOL = "BTC/USD"
 TIMEFRAME = "15min"
 PRICE_INTERVAL_SECONDS = 900
 RISK_REWARD_MULTIPLIER = 2.0
-MIN_STOP_POINTS = 200                # wider for BTC
-MAX_DAILY_LOSSES = 3                 # reduced from 6
-MIN_ATR = 150                        # skip if 15min ATR < 150 (choppy market)
+MIN_STOP_POINTS = 200
+MAX_DAILY_LOSSES = 3
+MIN_ATR_15M = 150
 
 ACTIVE_POSITIONS = []
 STATS = {"total_signals":0,"tp1_hits":0,"tp2_hits":0,"sl_hits":0,"daily_losses":0}
 SIGNAL_HISTORY = []
 
-FREE_CHANNEL_ID = -1004410090098      # @XAU_EDGE (or your BTC free channel)
+FREE_CHANNEL_ID = -1004410090098      # @XAU_EDGE or your BTC free channel
 VIP_CHANNEL_ID = -1004416190238
 HISTORY_CHANNEL_ID = FREE_CHANNEL_ID
 
 app = Flask(__name__)
 @app.route('/')
 def home():
-    return "BTC Bot (15min High‑Win MTF) is running!"
+    return "BTC Bot (Advanced MTF) is running!"
 
-cached_candles = []
+cached_candles_15m = []
 last_fetch_time = 0
 
 def fetch_real_candles():
-    global cached_candles, last_fetch_time
+    global cached_candles_15m, last_fetch_time
     now = datetime.now().timestamp()
-    if cached_candles and (now - last_fetch_time) < 60:
-        return cached_candles
+    if cached_candles_15m and (now - last_fetch_time) < 60:
+        return cached_candles_15m
     url = f"https://api.twelvedata.com/time_series?symbol={SYMBOL}&interval={TIMEFRAME}&outputsize=30&apikey={TWELVE_DATA_KEY}"
     try:
         res = requests.get(url, timeout=10)
@@ -56,50 +56,24 @@ def fetch_real_candles():
                     "close": float(bar["close"]),
                     "date": bar["datetime"]
                 })
-            cached_candles = candles
+            cached_candles_15m = candles
             last_fetch_time = now
-            logger.info(f"Fetched {len(candles)} {SYMBOL} candles. Price: ${candles[-1]['close']:.2f}")
+            logger.info(f"Fetched {len(candles)} 15m BTC candles. Price: ${candles[-1]['close']:.2f}")
             return candles
     except Exception as e:
         logger.error(f"API error: {e}")
-    return cached_candles
+    return cached_candles_15m
 
-# ---------- MTF Helpers ----------
-def fetch_tf_candles(symbol, interval="4h", outputsize=20):
-    api_key = os.getenv("TWELVE_DATA_KEY")
-    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}"
-    try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        if data.get("status") == "ok" and "values" in data:
-            candles = []
-            for bar in reversed(data["values"]):
-                candles.append({
-                    "open": float(bar["open"]),
-                    "high": float(bar["high"]),
-                    "low": float(bar["low"]),
-                    "close": float(bar["close"]),
-                    "date": bar["datetime"]
-                })
-            return candles
-    except:
-        pass
-    return []
+# ---------- Helper indicators ----------
+def calculate_ema(closes, period=20):
+    if len(closes) < period:
+        return np.mean(closes) if closes else 0
+    alpha = 2 / (period + 1)
+    ema = np.mean(closes[:period])
+    for price in closes[period:]:
+        ema = alpha * price + (1 - alpha) * ema
+    return ema
 
-def tf_trend(candles):
-    if len(candles) < 20:
-        return None
-    closes = [c["close"] for c in candles]
-    ema20 = calculate_ema(closes, 20)
-    ema50 = calculate_ema(closes, 50)
-    current = closes[-1]
-    if ema20 > ema50 and current > ema20:
-        return "BULLISH"
-    elif ema20 < ema50 and current < ema20:
-        return "BEARISH"
-    return None
-
-# ---------- Indicators & SMC Detection (unchanged) ----------
 def calculate_atr(candles, period=14):
     if len(candles) < period + 1:
         return MIN_STOP_POINTS
@@ -110,16 +84,21 @@ def calculate_atr(candles, period=14):
         tr_list.append(tr)
     return np.mean(tr_list[-period:]) if tr_list else MIN_STOP_POINTS
 
-def calculate_ema(closes, period=20):
-    if len(closes) < period:
-        return np.mean(closes) if closes else 0
-    alpha = 2 / (period + 1)
-    ema = np.mean(closes[:period])
-    for price in closes[period:]:
-        ema = alpha * price + (1 - alpha) * ema
-    return ema
+def calculate_rsi(prices, period=7):
+    if len(prices) < period + 1:
+        return 50
+    gains, losses = [], []
+    for i in range(1, len(prices)):
+        diff = prices[i] - prices[i-1]
+        gains.append(diff if diff > 0 else 0)
+        losses.append(abs(diff) if diff < 0 else 0)
+    avg_gain = np.mean(gains[-period:])
+    avg_loss = np.mean(losses[-period:])
+    if avg_loss == 0:
+        return 100
+    return 100 - (100 / (1 + avg_gain / avg_loss))
 
-def find_swing_levels(candles, lookback=20):
+def find_swing_points(candles, lookback=20):
     if len(candles) < lookback + 2:
         return None, None
     highs = [c["high"] for c in candles[-lookback:]]
@@ -134,6 +113,7 @@ def find_swing_levels(candles, lookback=20):
     support = min(swing_lows[-3:]) if swing_lows else min(lows)
     return resistance, support
 
+# ---------- SMC detection on any timeframe ----------
 def detect_fvg(candles):
     if len(candles) < 3: return None
     c1, c2, c3 = candles[-3], candles[-2], candles[-1]
@@ -173,44 +153,13 @@ def detect_choch(candles):
     if len(swing_lows)>=2 and current < swing_lows[-2]: return "BEARISH"
     return None
 
-def price_near_zone(price, zone, atr):
-    if zone is None: return False
-    return abs(price - zone) < atr
-
-def detect_candle_patterns(candles):
-    if len(candles) < 2: return None, None
-    prev = candles[-2]; curr = candles[-1]
-    o1, h1, l1, c1 = prev["open"], prev["high"], prev["low"], prev["close"]
-    o2, h2, l2, c2 = curr["open"], curr["high"], curr["low"], curr["close"]
-    if c1 < o1 and c2 > o2 and c2 > o1 and o2 < c1: return "Bullish Engulfing", "BUY"
-    if c1 > o1 and c2 < o2 and c2 < o1 and o2 > c1: return "Bearish Engulfing", "SELL"
-    body = abs(c2 - o2)
-    lower_wick = min(o2, c2) - l2
-    upper_wick = h2 - max(o2, c2)
-    total_range = h2 - l2
-    if total_range > 0:
-        if lower_wick > 2 * body and upper_wick < body and c2 > o2: return "Hammer", "BUY"
-        if upper_wick > 2 * body and lower_wick < body and c2 < o2: return "Shooting Star", "SELL"
-        if body / total_range < 0.1: return "Doji", None
-    return None, None
-
 def detect_bos(candles):
-    if len(candles) < 10: return None
-    highs = [c["high"] for c in candles[-10:]]
-    lows = [c["low"] for c in candles[-10:]]
-    swing_highs, swing_lows = [], []
-    for i in range(1, len(highs)-1):
-        if highs[i] > highs[i-1] and highs[i] > highs[i+1]: swing_highs.append(highs[i])
-        if lows[i] < lows[i-1] and lows[i] < lows[i+1]: swing_lows.append(lows[i])
-    if len(swing_highs) < 2 or len(swing_lows) < 2: return None
-    current = candles[-1]["close"]
-    if current > swing_highs[-2]: return "BULLISH"
-    elif current < swing_lows[-2]: return "BEARISH"
-    return None
+    # similar to CHoCH but with larger lookback
+    return detect_choch(candles)  # for simplicity we use same function
 
 def detect_sr_bounce(candles, atr):
     if len(candles) < 3: return None, None
-    resistance, support = find_swing_levels(candles)
+    resistance, support = find_swing_points(candles)
     if resistance is None or support is None: return None, None
     prev = candles[-2]; curr = candles[-1]
     price = curr["close"]
@@ -222,138 +171,315 @@ def detect_sr_bounce(candles, atr):
         return "RESISTANCE", "SELL"
     return None, None
 
-# ---------- Signal Engine (High‑Win) ----------
+# ---------- MTF data fetch ----------
+def fetch_tf_candles(symbol, interval="4h", outputsize=30):
+    api_key = os.getenv("TWELVE_DATA_KEY")
+    url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval={interval}&outputsize={outputsize}&apikey={api_key}"
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
+        if data.get("status") == "ok" and "values" in data:
+            candles = []
+            for bar in reversed(data["values"]):
+                candles.append({
+                    "open": float(bar["open"]),
+                    "high": float(bar["high"]),
+                    "low": float(bar["low"]),
+                    "close": float(bar["close"]),
+                    "date": bar["datetime"]
+                })
+            return candles
+    except:
+        pass
+    return []
+
+# ---------- 4H Analysis ----------
+def analyze_4h(candles_4h):
+    if len(candles_4h) < 20:
+        return {"direction": None, "key_resistance": None, "key_support": None, "near_zone": None}
+    closes = [c["close"] for c in candles_4h]
+    current = closes[-1]
+    ema20 = calculate_ema(closes, 20)
+    ema50 = calculate_ema(closes, 50)
+    direction = None
+    if ema20 > ema50 and current > ema20:
+        direction = "BULLISH"
+    elif ema20 < ema50 and current < ema20:
+        direction = "BEARISH"
+
+    resistance, support = find_swing_points(candles_4h, lookback=20)
+    near_zone = None
+    atr4h = calculate_atr(candles_4h, 14)
+    if support and abs(current - support) < atr4h * 1.5:
+        near_zone = "SUPPORT"
+    elif resistance and abs(current - resistance) < atr4h * 1.5:
+        near_zone = "RESISTANCE"
+
+    return {
+        "direction": direction,
+        "key_resistance": resistance,
+        "key_support": support,
+        "near_zone": near_zone
+    }
+
+# ---------- 1H Analysis ----------
+def analyze_1h(candles_1h):
+    if len(candles_1h) < 20:
+        return {"trend": None, "fvg": None, "ob": None, "bos": None, "liquidity": None, "reversal": None}
+
+    closes = [c["close"] for c in candles_1h]
+    current = closes[-1]
+    ema10 = calculate_ema(closes, 10)
+    ema20 = calculate_ema(closes, 20)
+    trend = None
+    if ema10 > ema20 and current > ema10:
+        trend = "BULLISH"
+    elif ema10 < ema20 and current < ema10:
+        trend = "BEARISH"
+
+    fvg = detect_fvg(candles_1h)
+    ob_bull, ob_bear = detect_order_blocks(candles_1h)
+    ob = None
+    if ob_bull:
+        ob = {"type": "BULLISH", "high": ob_bull["high"], "low": ob_bull["low"]}
+    elif ob_bear:
+        ob = {"type": "BEARISH", "high": ob_bear["high"], "low": ob_bear["low"]}
+
+    bos = detect_bos(candles_1h)
+
+    # Liquidity sweep
+    liquidity = None
+    highs = [c["high"] for c in candles_1h[-10:]]
+    lows = [c["low"] for c in candles_1h[-10:]]
+    swing_highs, swing_lows = [], []
+    for i in range(1, len(highs)-1):
+        if highs[i] > highs[i-1] and highs[i] > highs[i+1]: swing_highs.append(highs[i])
+        if lows[i] < lows[i-1] and lows[i] < lows[i+1]: swing_lows.append(lows[i])
+    if len(swing_highs) >= 2 and candles_1h[-1]["high"] > swing_highs[-1] and current < swing_highs[-1]:
+        liquidity = "BULLISH"
+    elif len(swing_lows) >= 2 and candles_1h[-1]["low"] < swing_lows[-1] and current > swing_lows[-1]:
+        liquidity = "BEARISH"
+
+    # Reversal
+    reversal = None
+    if bos == "BULLISH" and ob and ob["type"] == "BULLISH" and current <= ob["high"] and current >= ob["low"]:
+        reversal = "BULLISH"
+    elif bos == "BEARISH" and ob and ob["type"] == "BEARISH" and current <= ob["high"] and current >= ob["low"]:
+        reversal = "BEARISH"
+    elif bos == "BULLISH" and fvg == "BUY":
+        reversal = "BULLISH"
+    elif bos == "BEARISH" and fvg == "SELL":
+        reversal = "BEARISH"
+
+    return {
+        "trend": trend,
+        "fvg": fvg,
+        "ob": ob,
+        "bos": bos,
+        "liquidity": liquidity,
+        "reversal": reversal
+    }
+
+# ---------- 15min Confirmation ----------
+def confirm_15m(candles, trade_type):
+    if len(candles) < 3:
+        return False
+    prev = candles[-2]
+    curr = candles[-1]
+    o1, h1, l1, c1 = prev["open"], prev["high"], prev["low"], prev["close"]
+    o2, h2, l2, c2 = curr["open"], curr["high"], curr["low"], curr["close"]
+
+    pattern = False
+    if trade_type == "BUY":
+        if (c1 < o1 and c2 > o2 and c2 > o1 and o2 < c1): pattern = True
+        body = abs(c2 - o2)
+        lower_wick = min(o2, c2) - l2
+        upper_wick = h2 - max(o2, c2)
+        total_range = h2 - l2
+        if total_range > 0 and lower_wick > 2 * body and upper_wick < body and c2 > o2:
+            pattern = True
+    else:
+        if (c1 > o1 and c2 < o2 and c2 < o1 and o2 > c1): pattern = True
+        body = abs(c2 - o2)
+        lower_wick = min(o2, c2) - l2
+        upper_wick = h2 - max(o2, c2)
+        total_range = h2 - l2
+        if total_range > 0 and upper_wick > 2 * body and lower_wick < body and c2 < o2:
+            pattern = True
+
+    if not pattern:
+        return False
+
+    prices = [c["close"] for c in candles]
+    rsi = calculate_rsi(prices)
+    if trade_type == "BUY" and rsi > 70:
+        return False
+    if trade_type == "SELL" and rsi < 30:
+        return False
+
+    ema10 = calculate_ema(prices, 10)
+    if trade_type == "BUY" and curr["close"] < ema10:
+        return False
+    if trade_type == "SELL" and curr["close"] > ema10:
+        return False
+
+    return True
+
+# ---------- Main signal engine ----------
 def process_signals():
     global RISK_REWARD_MULTIPLIER, STATS
-    candles = fetch_real_candles()
-    if not candles or len(candles) < 8: return None
-    if STATS["daily_losses"] >= MAX_DAILY_LOSSES: return None
-
-    closes = [c["close"] for c in candles]
-    current_price = closes[-1]
-    atr = calculate_atr(candles)
-
-    # ----- Volatility Filter -----
-    if atr < MIN_ATR:
-        logger.info(f"ATR too low ({atr:.1f}), skipping")
+    candles_15m = fetch_real_candles()
+    if not candles_15m or len(candles_15m) < 8:
+        return None
+    if STATS["daily_losses"] >= MAX_DAILY_LOSSES:
         return None
 
-    resistance, support = find_swing_levels(candles)
+    atr_15m = calculate_atr(candles_15m)
+    if atr_15m < MIN_ATR_15M:
+        return None
 
-    ema_fast = calculate_ema(closes, 10)
-    ema_slow = calculate_ema(closes, 20)
-    trend_up = ema_fast > ema_slow and current_price > ema_fast
-    trend_down = ema_fast < ema_slow and current_price < ema_fast
+    candles_4h = fetch_tf_candles(SYMBOL, "4h", 30)
+    candles_1h = fetch_tf_candles(SYMBOL, "1h", 30)
+    if not candles_4h or not candles_1h:
+        logger.info("Missing higher timeframe data")
+        return None
 
-    fvg = detect_fvg(candles)
-    bullish_ob, bearish_ob = detect_order_blocks(candles)
-    choch = detect_choch(candles)
-    pattern_name, pattern_type = detect_candle_patterns(candles)
-    bos = detect_bos(candles)
-    sr_type, sr_signal = detect_sr_bounce(candles, atr)
+    h4 = analyze_4h(candles_4h)
+    h1 = analyze_1h(candles_1h)
 
-    # ===== MTF (mandatory 4H alignment) =====
-    h4_candles = fetch_tf_candles(SYMBOL, "4h", 20)
-    h1_candles = fetch_tf_candles(SYMBOL, "1h", 20)
-    h4_trend = tf_trend(h4_candles) if h4_candles else None
-    h1_trend = tf_trend(h1_candles) if h1_candles else None
+    if h4["direction"] is None:
+        return None
 
-    # If 4H trend is unknown, we still allow signals but without bonus (don't block)
-    # But we make 4H alignment mandatory only if trend is known
-    # For 4H mandatory: if trend is known AND it's opposite to signal, reject.
-    def four_h_ok(direction):
-        if h4_trend is None:
-            return True    # no data, can't block
-        return h4_trend == direction
+    current_price = candles_15m[-1]["close"]
 
-    sig, reason, grade, score_val = None, "", "C", 0
+    def score_buy():
+        if h4["direction"] == "BEARISH":
+            return None
+        score = 0
+        reasons = []
 
-    # BUY
-    if fvg == "BUY" or choch == "BULLISH" or (bullish_ob and price_near_zone(current_price, bullish_ob["low"], atr)):
-        # Mandatory 4H: must not be BEARISH (if known)
-        if h4_trend == "BEARISH":
-            logger.info("4H bearish, rejecting BUY")
+        if h4["direction"] == "BULLISH":
+            score += 15; reasons.append("4H↑")
+        if h4["near_zone"] == "SUPPORT":
+            score += 10; reasons.append("4H-Support")
+
+        if h1["trend"] == "BULLISH":
+            score += 10; reasons.append("1H↑")
+        if h1["fvg"] == "BUY":
+            score += 10; reasons.append("1H-FVG")
+        if h1["ob"] and h1["ob"]["type"] == "BULLISH" and current_price <= h1["ob"]["high"] and current_price >= h1["ob"]["low"]:
+            score += 10; reasons.append("1H-OB")
+        if h1["bos"] == "BULLISH":
+            score += 5; reasons.append("1H-BOS")
+        if h1["liquidity"] == "BULLISH":
+            score += 5; reasons.append("1H-Liq")
+        if h1["reversal"] == "BULLISH":
+            score += 10; reasons.append("1H-Rev")
+
+        if not confirm_15m(candles_15m, "BUY"):
             return None
 
-        score = 0; reasons = []
-        if fvg == "BUY": score += 20; reasons.append("FVG")
-        if choch == "BULLISH": score += 25; reasons.append("CHoCH")
-        if bullish_ob and current_price <= bullish_ob["high"] and current_price >= bullish_ob["low"]:
-            score += 10; reasons.append("OB")
-        if trend_up: score += 10; reasons.append("Trend↑")
-        if support and price_near_zone(current_price, support, atr):
-            score += 15; reasons.append("DemandZone")
-        last = candles[-1]; rng = last["high"] - last["low"]
-        if rng > 0:
-            body_ratio = abs(last["close"] - last["open"]) / rng
-            if body_ratio > 0.5: score += 5; reasons.append("StrongCandle")
-        if pattern_type == "BUY": score += 15; reasons.append(pattern_name)
-        elif pattern_name == "Doji" and trend_up: score += 10; reasons.append("Doji+Trend↑")
-        if bos == "BULLISH": score += 20; reasons.append("BOS↑")
-        if sr_type == "SUPPORT": score += 15; reasons.append("SupportBounce")
+        fvg_15 = detect_fvg(candles_15m)
+        ob_bull_15, _ = detect_order_blocks(candles_15m)
+        choch_15 = detect_choch(candles_15m)
+        bos_15 = detect_bos(candles_15m)
 
-        # ----- MTF Bonus -----
-        if h4_trend == "BULLISH":
-            score += 15; reasons.append("4H✅")
-        if h1_trend == "BULLISH":
-            score += 10; reasons.append("1H✅")
+        if fvg_15 == "BUY": score += 10; reasons.append("15m-FVG")
+        if ob_bull_15 and current_price <= ob_bull_15["high"] and current_price >= ob_bull_15["low"]:
+            score += 8; reasons.append("15m-OB")
+        if choch_15 == "BULLISH": score += 8; reasons.append("15m-CHoCH")
+        if bos_15 == "BULLISH": score += 5; reasons.append("15m-BOS")
+        score += 4; reasons.append("CandlePattern")
+
+        prices = [c["close"] for c in candles_15m]
+        rsi = calculate_rsi(prices)
+        if 40 <= rsi <= 60:
+            score += 3; reasons.append("RSI-mid")
 
         if score >= 75:
-            stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
-            sig = "BUY"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
-            sl = current_price - stop_distance
-            tp1 = current_price + stop_distance * RISK_REWARD_MULTIPLIER
-            tp2 = current_price + stop_distance * RISK_REWARD_MULTIPLIER * 2
-            # Grade based on score (only A or B since threshold is 75)
-            grade = "A" if score >= 90 else "B"
-            score_val = score
+            return {"type": "BUY", "score": score, "reasons": reasons}
+        return None
 
-    # SELL
-    elif fvg == "SELL" or choch == "BEARISH" or (bearish_ob and price_near_zone(current_price, bearish_ob["high"], atr)):
-        # Mandatory 4H: must not be BULLISH (if known)
-        if h4_trend == "BULLISH":
-            logger.info("4H bullish, rejecting SELL")
+    def score_sell():
+        if h4["direction"] == "BULLISH":
+            return None
+        score = 0
+        reasons = []
+
+        if h4["direction"] == "BEARISH":
+            score += 15; reasons.append("4H↓")
+        if h4["near_zone"] == "RESISTANCE":
+            score += 10; reasons.append("4H-Resistance")
+
+        if h1["trend"] == "BEARISH":
+            score += 10; reasons.append("1H↓")
+        if h1["fvg"] == "SELL":
+            score += 10; reasons.append("1H-FVG")
+        if h1["ob"] and h1["ob"]["type"] == "BEARISH" and current_price <= h1["ob"]["high"] and current_price >= h1["ob"]["low"]:
+            score += 10; reasons.append("1H-OB")
+        if h1["bos"] == "BEARISH":
+            score += 5; reasons.append("1H-BOS")
+        if h1["liquidity"] == "BEARISH":
+            score += 5; reasons.append("1H-Liq")
+        if h1["reversal"] == "BEARISH":
+            score += 10; reasons.append("1H-Rev")
+
+        if not confirm_15m(candles_15m, "SELL"):
             return None
 
-        score = 0; reasons = []
-        if fvg == "SELL": score += 20; reasons.append("FVG")
-        if choch == "BEARISH": score += 25; reasons.append("CHoCH")
-        if bearish_ob and current_price <= bearish_ob["high"] and current_price >= bearish_ob["low"]:
-            score += 10; reasons.append("OB")
-        if trend_down: score += 10; reasons.append("Trend↓")
-        if resistance and price_near_zone(current_price, resistance, atr):
-            score += 15; reasons.append("SupplyZone")
-        last = candles[-1]; rng = last["high"] - last["low"]
-        if rng > 0:
-            body_ratio = abs(last["close"] - last["open"]) / rng
-            if body_ratio > 0.5: score += 5; reasons.append("StrongCandle")
-        if pattern_type == "SELL": score += 15; reasons.append(pattern_name)
-        elif pattern_name == "Doji" and trend_down: score += 10; reasons.append("Doji+Trend↓")
-        if bos == "BEARISH": score += 20; reasons.append("BOS↓")
-        if sr_type == "RESISTANCE": score += 15; reasons.append("ResistanceReject")
+        fvg_15 = detect_fvg(candles_15m)
+        _, ob_bear_15 = detect_order_blocks(candles_15m)
+        choch_15 = detect_choch(candles_15m)
+        bos_15 = detect_bos(candles_15m)
 
-        # ----- MTF Bonus -----
-        if h4_trend == "BEARISH":
-            score += 15; reasons.append("4H✅")
-        if h1_trend == "BEARISH":
-            score += 10; reasons.append("1H✅")
+        if fvg_15 == "SELL": score += 10; reasons.append("15m-FVG")
+        if ob_bear_15 and current_price <= ob_bear_15["high"] and current_price >= ob_bear_15["low"]:
+            score += 8; reasons.append("15m-OB")
+        if choch_15 == "BEARISH": score += 8; reasons.append("15m-CHoCH")
+        if bos_15 == "BEARISH": score += 5; reasons.append("15m-BOS")
+        score += 4; reasons.append("CandlePattern")
+
+        prices = [c["close"] for c in candles_15m]
+        rsi = calculate_rsi(prices)
+        if 40 <= rsi <= 60:
+            score += 3; reasons.append("RSI-mid")
 
         if score >= 75:
-            stop_distance = max(atr * 1.5, MIN_STOP_POINTS)
-            sig = "SELL"; reason = " + ".join(reasons) + f" | ATR:{atr:.1f}"
-            sl = current_price + stop_distance
-            tp1 = current_price - stop_distance * RISK_REWARD_MULTIPLIER
-            tp2 = current_price - stop_distance * RISK_REWARD_MULTIPLIER * 2
-            grade = "A" if score >= 90 else "B"
-            score_val = score
+            return {"type": "SELL", "score": score, "reasons": reasons}
+        return None
 
-    if sig:
-        STATS["total_signals"] += 1
-        return {"type":sig,"reason":reason,"entry":current_price,"sl":sl,"tp1":tp1,"tp2":tp2,
-                "status":"PENDING","grade":grade,"score":score_val}
-    return None
+    buy = score_buy()
+    sell = score_sell()
 
-# ---------- Monitor & Signal Loop (plain text) ----------
+    if buy and (not sell or buy["score"] >= sell.get("score", 0)):
+        trade = buy
+    elif sell:
+        trade = sell
+    else:
+        return None
+
+    stop_distance = max(atr_15m * 1.5, MIN_STOP_POINTS)
+    sig = trade["type"]
+    reason = " + ".join(trade["reasons"])
+    sl = current_price - stop_distance if sig == "BUY" else current_price + stop_distance
+    tp1 = current_price + (stop_distance * RISK_REWARD_MULTIPLIER) if sig == "BUY" else current_price - (stop_distance * RISK_REWARD_MULTIPLIER)
+    tp2 = current_price + (stop_distance * RISK_REWARD_MULTIPLIER * 2) if sig == "BUY" else current_price - (stop_distance * RISK_REWARD_MULTIPLIER * 2)
+    grade = "A" if trade["score"] >= 90 else "B"
+
+    STATS["total_signals"] += 1
+    return {
+        "type": sig,
+        "reason": reason,
+        "entry": current_price,
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "status": "PENDING",
+        "grade": grade,
+        "score": trade["score"]
+    }
+
+# ---------- Position monitor & signal loop ----------
 async def monitor_positions(bot, price):
     global ACTIVE_POSITIONS, CHAT_ID, STATS, SIGNAL_HISTORY
     surv = []
@@ -420,7 +546,7 @@ async def signal_loop(context: ContextTypes.DEFAULT_TYPE):
                 f"  SL       ${sig['sl']:.2f} ({abs(sig['entry']-sig['sl']):.1f} pts)\n"
                 f"  TP1      ${sig['tp1']:.2f} (+{abs(sig['tp1']-sig['entry']):.1f} pts)\n"
                 f"  TP2      ${sig['tp2']:.2f} (+{abs(sig['tp2']-sig['entry']):.1f} pts)\n\n"
-                f"  [{sig['reason'].replace(' | ','] [')}]\n\n"
+                f"  [{sig['reason']}]\n\n"
                 f"  ⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
             )
             await context.bot.send_message(chat_id=VIP_CHANNEL_ID, text=vip_msg)
@@ -438,34 +564,17 @@ async def signal_loop(context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=free_msg)
             await context.bot.send_message(chat_id=CHAT_ID, text=vip_msg)
 
-# ---------- Daily Bias ----------
+# ---------- Daily bias ----------
 async def daily_bias(context: ContextTypes.DEFAULT_TYPE):
     if not RUN_SIGNALS or not CHAT_ID: return
-    api_key = os.getenv("TWELVE_DATA_KEY")
-    if not api_key: return
-    url = f"https://api.twelvedata.com/time_series?symbol=BTC/USD&interval=1h&outputsize=20&apikey={api_key}"
-    try:
-        res = requests.get(url, timeout=10)
-        data = res.json()
-        if data.get("status") == "ok" and "values" in data:
-            closes = [float(bar["close"]) for bar in reversed(data["values"])]
-            ema_20 = calculate_ema(closes, 20)
-            ema_50 = calculate_ema(closes, 50)
-            current = closes[-1]
-            if ema_20 > ema_50 and current > ema_20:
-                bias = "🟢 BULLISH"
-                advice = "Prefer BUY setups."
-            elif ema_20 < ema_50 and current < ema_20:
-                bias = "🔴 BEARISH"
-                advice = "Prefer SELL setups."
-            else:
-                bias = "⚪ NEUTRAL"
-                advice = "Wait for clear break."
-        else:
-            bias, advice = "⚪ UNKNOWN", "No data."
-    except:
-        bias, advice = "⚪ UNKNOWN", "Error."
-    await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=f"📊 *BTC/USD DAILY BIAS* – {bias}\n{advice}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
+    candles = fetch_real_candles()
+    if not candles: return
+    closes = [c["close"] for c in candles]
+    ema20 = calculate_ema(closes, 20)
+    current = closes[-1]
+    bias = "🟢 BULLISH" if current > ema20 else "🔴 BEARISH"
+    msg = f"📊 BTC/USD DAILY BIAS – {bias}\n⏰ {datetime.now(timezone.utc).strftime('%H:%M UTC')}"
+    await context.bot.send_message(chat_id=FREE_CHANNEL_ID, text=msg)
 
 async def report_callback(context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID, STATS
@@ -478,7 +587,7 @@ async def report_callback(context: ContextTypes.DEFAULT_TYPE):
 # ---------- Commands ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global CHAT_ID; CHAT_ID = update.effective_chat.id
-    await update.message.reply_text("🟠 BTC/USD SMC (15min High‑Win MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
+    await update.message.reply_text("🟠 BTC/USD SMC (Advanced MTF)\n/start_signals /stop_signals /status /report /history /join_vip")
 
 async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS, CHAT_ID
@@ -488,7 +597,7 @@ async def start_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.job_queue.run_repeating(signal_loop, interval=PRICE_INTERVAL_SECONDS, name="btc_job")
     context.job_queue.run_repeating(report_callback, interval=86400, first=86400, name="report_job")
     context.job_queue.run_daily(daily_bias, time=time(hour=8, minute=0, tzinfo=timezone.utc), name="bias_job")
-    await update.message.reply_text("🚀 BTC High‑Win scanner started (15min) + daily bias")
+    await update.message.reply_text("🚀 BTC Advanced MTF scanner started (15min) + daily bias")
 
 async def stop_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global RUN_SIGNALS
